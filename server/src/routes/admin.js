@@ -11,37 +11,50 @@ import { withId, withIdList, memberRef, safeUser } from '../utils/serialize.js';
 
 export const adminRouter = express.Router();
 
-function dayRange(dateStr) {
-  const d = dateStr ? new Date(dateStr) : new Date();
-  const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  const end = new Date(start);
-  end.setDate(end.getDate() + 1);
+// "Today" means today in Asia/Dhaka, not server time (Render runs on UTC).
+// Dhaka is UTC+06:00 year-round (no DST), so the offset is fixed. The old
+// code used the server's local date, which showed yesterday's figures for
+// the first 6 hours of every Dhaka day.
+function dhakaDayRange(dateStr) {
+  let y;
+  let m;
+  let d;
+  if (dateStr && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    [y, m, d] = dateStr.split('-').map(Number);
+  } else {
+    const dhakaNow = new Date(Date.now() + 6 * 60 * 60 * 1000);
+    y = dhakaNow.getUTCFullYear();
+    m = dhakaNow.getUTCMonth() + 1;
+    d = dhakaNow.getUTCDate();
+  }
+  const start = new Date(Date.UTC(y, m - 1, d) - 6 * 60 * 60 * 1000);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
   return { start, end };
 }
 
 adminRouter.get('/dashboard', requireAuth, requirePermission('reports:read'), asyncHandler(async (req, res) => {
-  const { start, end } = dayRange(req.query.date);
-  const [activeMembers, todayVehicleAgg, todayWbAgg, todayPaymentAgg, outstandingAgg, recentTx, recentMembers] = await Promise.all([
+  const { start, end } = dhakaDayRange(req.query.date);
+  // One parallel batch (was two sequential batches) so the dashboard needs
+  // a single round of queries instead of waiting twice.
+  const since = new Date(start.getTime() - 14 * 24 * 60 * 60 * 1000);
+  const [activeMembers, todayVehicleAgg, todayWbAgg, todayPaymentAgg, outstandingAgg, recentTx, recentMembers, vehicleTrendRaw, wbByCategoryRaw, paymentTrendRaw, topOutstanding] = await Promise.all([
     prisma.member.count({ where: { status: 'ACTIVE' } }),
     prisma.vehicleEntry.aggregate({ where: { entryDate: { gte: start, lt: end } }, _sum: { quantity: true, total: true } }),
     prisma.weighbridgeEntry.aggregate({ where: { occurredAt: { gte: start, lt: end }, status: 'POSTED' }, _sum: { fee: true } }),
     prisma.payment.aggregate({ where: { paidAt: { gte: start, lt: end }, status: 'POSTED' }, _sum: { amount: true } }),
     prisma.member.aggregate({ where: { status: 'ACTIVE' }, _sum: { outstandingBalance: true } }),
     prisma.ledgerEntry.findMany({ orderBy: [{ occurredAt: 'desc' }, { createdAt: 'desc' }], take: 10, include: { member: { select: { id: true, memberId: true, businessName: true, ownerName: true } } } }),
-    prisma.member.findMany({ orderBy: { createdAt: 'desc' }, take: 5 }),
-  ]);
-  // Daily vehicle trend (last 14 days) + weighbridge by category + payment trend.
-  const since = new Date();
-  since.setDate(since.getDate() - 14);
-  const [vehicleTrendRaw, wbByCategoryRaw, paymentTrendRaw, topOutstanding] = await Promise.all([
+    prisma.member.findMany({ orderBy: { createdAt: 'desc' }, take: 5, select: { id: true, memberId: true, businessName: true, ownerName: true, status: true, createdAt: true } }),
+    // Trend dates are grouped in Asia/Dhaka so chart labels match the day
+    // the association actually operated, not the UTC day.
     prisma.$queryRaw`
-      SELECT TO_CHAR("entryDate", 'YYYY-MM-DD') AS date, SUM("quantity") AS vehicles, SUM("total") AS amount
+      SELECT TO_CHAR("entryDate" AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS date, SUM("quantity") AS vehicles, SUM("total") AS amount
       FROM "VehicleEntry" WHERE "entryDate" >= ${since} GROUP BY date ORDER BY date`,
     prisma.weighbridgeEntry.groupBy({ by: ['category'], where: { status: 'POSTED' }, _sum: { fee: true }, _count: { _all: true } }),
     prisma.$queryRaw`
-      SELECT TO_CHAR("paidAt", 'YYYY-MM-DD') AS date, SUM("amount") AS total
+      SELECT TO_CHAR("paidAt" AT TIME ZONE 'Asia/Dhaka', 'YYYY-MM-DD') AS date, SUM("amount") AS total
       FROM "Payment" WHERE "status" = 'POSTED' AND "paidAt" >= ${since} GROUP BY date ORDER BY date`,
-    prisma.member.findMany({ where: { status: 'ACTIVE' }, orderBy: { outstandingBalance: 'desc' }, take: 10 }),
+    prisma.member.findMany({ where: { status: 'ACTIVE' }, orderBy: { outstandingBalance: 'desc' }, take: 10, select: { memberId: true, businessName: true, outstandingBalance: true } }),
   ]);
   const vehicleTrend = vehicleTrendRaw.map((r) => ({ _id: r.date, vehicles: Number(r.vehicles), amount: Number(r.amount) }));
   const wbByCategory = wbByCategoryRaw.map((r) => ({ _id: r.category, total: r._sum.fee || 0, count: r._count._all }));

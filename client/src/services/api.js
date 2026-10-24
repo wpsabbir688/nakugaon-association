@@ -17,7 +17,13 @@ api.interceptors.response.use(
   (res) => res,
   async (err) => {
     const original = err.config;
-    if (err.response?.status === 401 && !original._retry) {
+    // A refresh request must NEVER trigger another refresh: when the refresh
+    // cookie is expired/invalid, retrying it recurses unboundedly (each retry
+    // is a new request, so _retry never stops it), flooding /auth/refresh
+    // until the rate limit and leaving the app stuck on "Loading…" forever
+    // because AuthProvider never reaches ready=true.
+    const isRefreshCall = original.url?.includes('/auth/refresh');
+    if (err.response?.status === 401 && !original._retry && !isRefreshCall) {
       original._retry = true;
       try {
         const r = await api.post('/auth/refresh');

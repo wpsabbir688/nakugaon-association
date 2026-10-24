@@ -1,11 +1,12 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, lazy, Suspense } from 'react';
 import api from '../../services/api.js';
 import { useLanguage } from '../../contexts/LanguageContext.jsx';
 import { StatCard } from '../../components/ui.jsx';
 import { formatBDT, formatDate } from '../../utils/format.js';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 
-const COLORS = ['#0b2545', '#0f766e', '#14b8a6', '#f59e0b'];
+// Recharts is heavy — load it only when the dashboard renders, so the
+// first paint (stats + transactions) is not blocked by the chart bundle.
+const DashboardCharts = lazy(() => import('./DashboardCharts.jsx'));
 
 export function AdminDashboard() {
   const { t } = useLanguage();
@@ -27,34 +28,9 @@ export function AdminDashboard() {
         <StatCard title={t.todayPayments} value={formatBDT(data.todayPayments)} />
         <StatCard title={t.totalOutstanding} value={formatBDT(data.totalOutstanding)} accent="text-red-700" />
       </div>
-      <div className="grid lg:grid-cols-2 gap-4 mt-4">
-        <div className="bg-white border rounded-2xl p-4">
-          <h2 className="font-semibold mb-2">Daily vehicles (14 days)</h2>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={data.charts.vehicleTrend}>
-                <XAxis dataKey="_id" tick={{ fontSize: 11 }} />
-                <YAxis tick={{ fontSize: 11 }} />
-                <Tooltip />
-                <Bar dataKey="vehicles" fill="#0b2545" />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-        <div className="bg-white border rounded-2xl p-4">
-          <h2 className="font-semibold mb-2">Weighbridge by category</h2>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie data={data.charts.wbByCategory} dataKey="total" nameKey="_id" outerRadius={90} label>
-                  {data.charts.wbByCategory.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                </Pie>
-                <Tooltip formatter={(v) => formatBDT(v)} />
-              </PieChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-      </div>
+      <Suspense fallback={<div className="bg-white border rounded-2xl p-4 mt-4 text-slate-500">{t.loading}</div>}>
+        <DashboardCharts charts={data.charts} />
+      </Suspense>
       <div className="bg-white border rounded-2xl p-4 mt-4">
         <h2 className="font-semibold mb-2">Recent transactions</h2>
         <div className="overflow-x-auto">
