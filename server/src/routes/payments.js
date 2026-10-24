@@ -1,15 +1,13 @@
 import express from 'express';
-import mongoose from 'mongoose';
 import { z } from 'zod';
-import { Member } from '../models/Member.js';
-import { Payment } from '../models/Payments.js';
-import { LedgerEntry } from '../models/LedgerEntry.js';
-import { nextSeq } from '../models/Counter.js';
+import { prisma } from '../config/db.js';
+import { nextSeq } from '../constants.js';
 import { requireAuth, requirePermission } from '../middleware/auth.js';
 import { validate, paginationQuery, paginate, pageMeta } from '../middleware/validate.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
 import { notFound, badRequest } from '../utils/errors.js';
 import { postPayment, reverseLedger, audit, computeBalance } from '../services/ledgerService.js';
+import { withId, memberRef } from '../utils/serialize.js';
 
 export const paymentsRouter = express.Router();
 
@@ -26,89 +24,84 @@ const paymentBody = z.object({
   idempotencyKey: z.string().max(100).optional(),
 });
 
+function shapeRow(r) {
+  const row = withId(r);
+  row.member = memberRef(r.member);
+  return row;
+}
+
+const memberSelect = { select: { id: true, memberId: true, businessName: true, ownerName: true } };
+
 paymentsRouter.get('/', requireAuth, requirePermission('payments:read'), validate({ query: paginationQuery.extend({ memberId: z.string().optional(), method: z.string().optional(), from: z.string().optional(), to: z.string().optional() }) }), asyncHandler(async (req, res) => {
   const { page, limit, skip } = paginate(req.query);
-  const filter = {};
+  const where = {};
   if (req.query.memberId) {
-    const m = await Member.findOne({ memberId: req.query.memberId });
-    if (m) filter.member = m._id;
+    const m = await prisma.member.findUnique({ where: { memberId: req.query.memberId } });
+    if (m) where.memberId = m.id;
   }
-  if (req.query.method) filter.method = req.query.method;
+  if (req.query.method) where.method = req.query.method;
   if (req.query.from || req.query.to) {
-    filter.paidAt = {};
-    if (req.query.from) filter.paidAt.$gte = new Date(req.query.from);
-    if (req.query.to) filter.paidAt.$lte = new Date(req.query.to);
+    where.paidAt = {};
+    if (req.query.from) where.paidAt.gte = new Date(req.query.from);
+    if (req.query.to) where.paidAt.lte = new Date(req.query.to);
   }
   const [total, rows] = await Promise.all([
-    Payment.countDocuments(filter),
-    Payment.find(filter).populate('member', 'memberId businessName ownerName').sort({ paidAt: -1, createdAt: -1 }).skip(skip).limit(limit),
+    prisma.payment.count({ where }),
+    prisma.payment.findMany({ where, include: { member: memberSelect }, orderBy: [{ paidAt: 'desc' }, { createdAt: 'desc' }], skip, take: limit }),
   ]);
-  res.json({ rows, meta: pageMeta(total, page, limit) });
+  res.json({ rows: rows.map(shapeRow), meta: pageMeta(total, page, limit) });
 }));
 
 paymentsRouter.get('/:id', requireAuth, requirePermission('payments:read'), asyncHandler(async (req, res) => {
-  const p = await Payment.findById(req.params.id).populate('member', 'memberId businessName ownerName');
+  const p = await prisma.payment.findUnique({ where: { id: req.params.id }, include: { member: memberSelect } });
   if (!p) throw notFound('Payment not found');
-  res.json({ payment: p });
+  res.json({ payment: shapeRow(p) });
 }));
 
 paymentsRouter.post('/', requireAuth, requirePermission('payments:write'), validate({ body: paymentBody }), asyncHandler(async (req, res) => {
-  const member = await Member.findOne({ memberId: req.body.memberId, status: 'ACTIVE' });
+  const member = await prisma.member.findFirst({ where: { memberId: req.body.memberId, status: 'ACTIVE' } });
   if (!member) throw notFound('Active member not found');
   if (req.body.idempotencyKey) {
-    const existing = await Payment.findOne({ idempotencyKey: req.body.idempotencyKey });
-    if (existing) return res.json({ payment: existing, duplicate: true });
+    const existing = await prisma.payment.findUnique({ where: { idempotencyKey: req.body.idempotencyKey }, include: { member: memberSelect } });
+    if (existing) return res.json({ payment: shapeRow(existing), duplicate: true });
   }
-  const previousBalance = await computeBalance(member._id);
-  const session = await mongoose.startSession();
-  let payment;
-  try {
-    await session.withTransaction(async () => {
-      const day = new Date(req.body.paidAt).toISOString().slice(0, 10).replaceAll('-', '');
-      const seq = await nextSeq(`receipt-${day}`, session);
-      const receiptNumber = `REC-${day}-${String(seq).padStart(4, '0')}`;
-      const [doc] = await Payment.create([{
-        member: member._id, amount: req.body.amount, paidAt: new Date(req.body.paidAt),
+  const previousBalance = await computeBalance(member.id);
+  const payment = await prisma.$transaction(async (tx) => {
+    const day = new Date(req.body.paidAt).toISOString().slice(0, 10).replaceAll('-', '');
+    const seq = await nextSeq(tx, `receipt-${day}`);
+    const receiptNumber = `REC-${day}-${String(seq).padStart(4, '0')}`;
+    const doc = await tx.payment.create({
+      data: {
+        memberId: member.id, amount: req.body.amount, paidAt: new Date(req.body.paidAt),
         method: req.body.method, receiptNumber, reference: req.body.reference,
-        receivedBy: req.user._id, notes: req.body.notes,
+        receivedById: req.user.id, notes: req.body.notes,
         idempotencyKey: req.body.idempotencyKey || null,
-      }], { session });
-      const ledger = await postPayment({
-        memberId: member._id, amount: req.body.amount, reference: receiptNumber,
-        referenceType: 'Payment', referenceId: doc._id, method: req.body.method,
-        recordedBy: req.user._id, occurredAt: new Date(req.body.paidAt),
-        idempotencyKey: req.body.idempotencyKey ? `pay-${req.body.idempotencyKey}` : null, session,
-      });
-      doc.ledgerEntry = ledger._id;
-      await doc.save({ session });
-      payment = doc;
+      },
     });
-  } finally {
-    await session.endSession();
-  }
-  const remainingBalance = await computeBalance(member._id);
-  await audit({ actor: req.user._id, actorName: req.user.name, action: 'payment.create', entity: 'Payment', entityId: payment._id.toString(), details: { memberId: member.memberId, amount: req.body.amount, receiptNumber: payment.receiptNumber }, ipAddress: req.ip });
-  res.status(201).json({ payment, previousBalance, remainingBalance });
+    const ledger = await postPayment({
+      memberId: member.id, amount: req.body.amount, reference: receiptNumber,
+      referenceType: 'Payment', referenceId: doc.id, method: req.body.method,
+      recordedBy: req.user.id, occurredAt: new Date(req.body.paidAt),
+      idempotencyKey: req.body.idempotencyKey ? `pay-${req.body.idempotencyKey}` : null, tx,
+    });
+    return tx.payment.update({ where: { id: doc.id }, data: { ledgerEntryId: ledger.id } });
+  });
+  const remainingBalance = await computeBalance(member.id);
+  await audit({ actor: req.user.id, actorName: req.user.name, action: 'payment.create', entity: 'Payment', entityId: payment.id, details: { memberId: member.memberId, amount: req.body.amount, receiptNumber: payment.receiptNumber }, ipAddress: req.ip });
+  res.status(201).json({ payment: withId(payment), previousBalance, remainingBalance });
 }));
 
 // Reversal: creates a negating ledger row + mirror journal entry. The original
 // payment is marked REVERSED but never deleted.
 paymentsRouter.post('/:id/reverse', requireAuth, requirePermission('payments:reverse'), validate({ body: z.object({ reason: z.string().trim().min(1).max(500) }) }), asyncHandler(async (req, res) => {
-  const payment = await Payment.findById(req.params.id);
+  const payment = await prisma.payment.findUnique({ where: { id: req.params.id } });
   if (!payment) throw notFound('Payment not found');
   if (payment.status === 'REVERSED') throw badRequest('Payment was already reversed');
-  const session = await mongoose.startSession();
-  try {
-    await session.withTransaction(async () => {
-      await reverseLedger({ ledgerId: payment.ledgerEntry, reason: req.body.reason, recordedBy: req.user._id, session });
-      payment.status = 'REVERSED';
-      await payment.save({ session });
-    });
-  } finally {
-    await session.endSession();
-  }
-  await audit({ actor: req.user._id, actorName: req.user.name, action: 'payment.reverse', entity: 'Payment', entityId: payment._id.toString(), details: { reason: req.body.reason }, ipAddress: req.ip });
-  res.json({ payment });
+  await prisma.$transaction(async (tx) => {
+    await reverseLedger({ ledgerId: payment.ledgerEntryId, reason: req.body.reason, recordedBy: req.user.id, tx });
+    await tx.payment.update({ where: { id: payment.id }, data: { status: 'REVERSED' } });
+  });
+  const updated = await prisma.payment.findUnique({ where: { id: payment.id } });
+  await audit({ actor: req.user.id, actorName: req.user.name, action: 'payment.reverse', entity: 'Payment', entityId: payment.id, details: { reason: req.body.reason }, ipAddress: req.ip });
+  res.json({ payment: withId(updated) });
 }));
-
-void LedgerEntry;

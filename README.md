@@ -11,7 +11,7 @@ and a member portal. Routes are `/bn/…` and `/en/…` with a language switcher
 
 - **Frontend:** React 19 + Vite 6 + React Router 7 + Tailwind CSS v4 + Axios +
   React Hook Form + Zod + Lucide + Recharts (JavaScript / JSX only, no TypeScript)
-- **Backend:** Node.js + Express (ES modules) + Mongoose + MongoDB
+- **Backend:** Node.js + Express (ES modules) + Prisma + PostgreSQL (Neon-compatible)
 - **Auth:** JWT access token (15 min, memory only — never localStorage) +
   7-day HttpOnly refresh cookie with rotation + bcrypt password hashing
 - **Tests:** Vitest + Supertest (server). Playwright E2E was **not** run — no
@@ -19,8 +19,8 @@ and a member portal. Routes are `/bn/…` and `/en/…` with a language switcher
 
 ## Quick start (local development)
 
-Prerequisites: Node.js 20+, MongoDB 8.x running as a **single-node replica set**
-(transactions require it — see `docs/DATABASE.md`).
+Prerequisites: Node.js 20+, PostgreSQL 16 (local dev/test) — see
+`docs/DATABASE.md` for the schema and transaction notes.
 
 ```bash
 # 1. Install
@@ -31,8 +31,7 @@ cp .env.example server/.env
 # Edit server/.env: set JWT_ACCESS_SECRET and JWT_REFRESH_SECRET to long random strings.
 
 # 3. Create the first admin (never use the demo seed for real data)
-ADMIN_PASSWORD='<redacted>' node server/scripts/create-admin.js
-# or: ADMIN_NAME="..." ADMIN_EMAIL="admin@example.com" ADMIN_PASSWORD="..." node server/scripts/create-admin.js
+ADMIN_PASSWORD='<redacted>' node server/scripts/create-admin.js "Full Name" admin@example.com
 
 # 4. Run (server :4001, client :5173 with /api proxy)
 npm run dev
@@ -50,10 +49,10 @@ Open http://localhost:5173 — it redirects to `/bn`.
 | Weighbridge | Bhutan ৳100, Bangladeshi ৳200, Lorry/crab ৳100, Trolley ৳300 — editable fee rules that never rewrite history; each posting creates the record + ledger charge + balance update + audit event atomically |
 | Payments | Cash/bank/other, FIFO allocation records, partial and full payments, overpayment becomes a credit balance, unique receipts (`REC-YYYYMMDD-####`), authorized reversal only (with reason, never silent delete) |
 | Ledger & accounting | Integer Taka only (never floats for money). `Outstanding = Opening + Posted Charges − Payments − Approved Credits`. Ledger rows are the source of truth; member `outstandingBalance` is a transactionally maintained cache with an admin reconcile endpoint. Balanced double-entry journal entries are written for every charge, payment, expense, and reversal (Dr Receivable / Cr Fee Income, Dr Cash/Bank / Cr Receivable, Dr Expense / Cr Cash/Bank). |
-| Admin dashboard | Real MongoDB aggregates via API: active members, today's vehicles/charges/payments, total outstanding, 14-day vehicle trend, weighbridge by category, recent transactions (Recharts) |
+| Admin dashboard | Real Postgres aggregates via API: active members, today's vehicles/charges/payments, total outstanding, 14-day vehicle trend, weighbridge by category, recent transactions (Recharts) |
 | Reports | JSON + CSV (formula-injection protected): vehicles, weighbridge, payments, outstanding, income/expense |
 | Member portal | Own profile, own ledger, own statement CSV — server-enforced scoping; a member can never read another member's data |
-| Security | Helmet, restricted CORS, Zod validation, rate limits, escaped search regex (NoSQL-injection safe), 2 MB JPG/PNG/WebP uploads with random filenames, audit log, no stack traces in production responses |
+| Security | Helmet, restricted CORS, Zod validation, rate limits, parameterized case-insensitive search (injection-safe), 2 MB JPG/PNG/WebP uploads with random filenames, audit log, no stack traces in production responses |
 | Roles | SUPER_ADMIN, MANAGER, ACCOUNTANT, OPERATOR, MEMBER, PUBLIC — enforced server-side, least privilege |
 
 ## Honesty notes — read before deploying
@@ -81,16 +80,16 @@ Open http://localhost:5173 — it redirects to `/bn`.
 
 ```
 client/   React frontend (src/pages/public, src/pages/admin, src/pages/member)
-server/   Express API (src/routes, src/models, src/services, src/middleware)
+server/   Express API (src/routes, src/services, src/middleware, prisma/schema.prisma)
   scripts/  create-admin.js (real admins), seed.js (fictional demo data, gated)
 docs/     INSTALL.md, API.md, DATABASE.md, TESTING.md, DEPLOYMENT.md
 ```
 
 ## Documentation
 
-- [docs/INSTALL.md](docs/INSTALL.md) — install & run, incl. local MongoDB replica set
+- [docs/INSTALL.md](docs/INSTALL.md) — install & run, incl. local PostgreSQL
 - [docs/API.md](docs/API.md) — endpoint reference, roles, idempotency, receipts
-- [docs/DATABASE.md](docs/DATABASE.md) — models, ledger/journal design, replica-set requirement
+- [docs/DATABASE.md](docs/DATABASE.md) — Prisma models, ledger/journal design, transaction notes
 - [docs/TESTING.md](docs/TESTING.md) — what was run, actual results, what was not run
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — production deployment (documentation only; nothing provisioned)
 

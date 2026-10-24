@@ -1,5 +1,4 @@
-import mongoose from 'mongoose';
-
+// Shared constants (previously lived on the Mongoose models).
 export const ROLES = ['SUPER_ADMIN', 'MANAGER', 'ACCOUNTANT', 'OPERATOR', 'MEMBER'];
 export const ROLE_PERMISSIONS = {
   SUPER_ADMIN: ['*'],
@@ -11,19 +10,29 @@ export const ROLE_PERMISSIONS = {
   MEMBER: ['portal:read', 'members:read', 'ledger:read'],
 };
 
-const userSchema = new mongoose.Schema(
-  {
-    name: { type: String, required: true, trim: true, maxlength: 120 },
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-    passwordHash: { type: String, required: true, select: false },
-    role: { type: String, enum: ROLES, required: true },
-    memberId: { type: mongoose.Schema.Types.ObjectId, ref: 'Member', default: null },
-    isActive: { type: Boolean, default: true },
-    refreshTokenHash: { type: String, default: null, select: false },
-    resetTokenHash: { type: String, default: null, select: false },
-    resetTokenExpiresAt: { type: Date, default: null, select: false },
-  },
-  { timestamps: true }
-);
+export const WEIGHBRIDGE_CATEGORIES = [
+  { key: 'WB_BHUTAN', label: 'Bhutan vehicle' },
+  { key: 'WB_BD', label: 'Bangladeshi vehicle' },
+  { key: 'WB_LORRY', label: 'Lorry/crab vehicle' },
+  { key: 'WB_TROLLEY', label: 'Trolley' },
+];
 
-export const User = mongoose.model('User', userSchema);
+export const DEFAULT_FEES = {
+  VEHICLE_PER_UNIT: 50,
+  WB_BHUTAN: 100,
+  WB_BD: 200,
+  WB_LORRY: 100,
+  WB_TROLLEY: 300,
+};
+
+// Atomically reserve the next sequence value for a key (safe under
+// concurrency: inside a transaction the upsert-increment serializes on the
+// counter row). `tx` is a Prisma transaction client.
+export async function nextSeq(tx, key) {
+  const row = await tx.counter.upsert({
+    where: { key },
+    update: { seq: { increment: 1 } },
+    create: { key, seq: 1 },
+  });
+  return row.seq;
+}

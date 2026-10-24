@@ -1,7 +1,5 @@
-import mongoose from 'mongoose';
-import { Member } from '../models/Member.js';
-import { FeeRule, DEFAULT_FEES } from '../models/FeeRule.js';
-import { Account } from '../models/Account.js';
+import { prisma } from '../config/db.js';
+import { DEFAULT_FEES } from '../constants.js';
 
 // Seed reference data: fee rules + chart of accounts. Idempotent.
 export async function ensureReferenceData() {
@@ -13,7 +11,7 @@ export async function ensureReferenceData() {
     { key: 'WB_TROLLEY', label: 'Trolley', category: 'WEIGHBRIDGE', amount: DEFAULT_FEES.WB_TROLLEY },
   ];
   for (const f of fees) {
-    await FeeRule.updateOne({ key: f.key }, { $setOnInsert: f }, { upsert: true });
+    await prisma.feeRule.upsert({ where: { key: f.key }, update: {}, create: f });
   }
   const accounts = [
     { code: 'RECEIVABLE', name: 'Member Receivables', type: 'ASSET' },
@@ -25,7 +23,6 @@ export async function ensureReferenceData() {
     { code: 'EXPENSE', name: 'General Expenses', type: 'EXPENSE' },
   ];
   for (const a of accounts) {
-    await Account.updateOne({ code: a.code }, { $setOnInsert: a }, { upsert: true });
+    await prisma.account.upsert({ where: { code: a.code }, update: {}, create: a });
   }
-  void mongoose;
 }

@@ -1,1 +1,33 @@
-{"dependencies":{"bcrypt":"^5.1.1","cookie-parser":"^1.4.6","cors":"^2.8.5","express":"^4.21.2","express-rate-limit":"^7.5.0","helmet":"^8.0.0","jsonwebtoken":"^9.0.2","mongoose":"^8.9.0","multer":"^2.5.0","zod":"^3.24.1"},"devDependencies":{"supertest":"^7.0.0","vitest":"^3.0.0"},"name":"nakugaon-association-server","private":true,"scripts":{"create-admin":"node scripts/create-admin.js","dev":"node --env-file=.env src/server.js","seed":"node scripts/seed.js","start":"node src/server.js","test":"vitest run"},"type":"module","version":"1.0.0"}
+{
+  "dependencies": {
+    "@prisma/client": "^6.5.0",
+    "bcrypt": "^5.1.1",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.5.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "prisma": "^6.5.0",
+    "supertest": "^7.0.0",
+    "vitest": "^3.0.0"
+  },
+  "name": "nakugaon-association-server",
+  "private": true,
+  "scripts": {
+    "create-admin": "node scripts/create-admin.js",
+    "dev": "node --env-file=.env src/server.js",
+    "seed": "node scripts/seed.js",
+    "start": "node src/server.js",
+    "test": "vitest run",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy"
+  },
+  "type": "module",
+  "version": "1.0.0"
+}

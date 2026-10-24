@@ -3,36 +3,42 @@
 ## Prerequisites
 
 - Node.js 20+ and npm
-- MongoDB 8.x
+- PostgreSQL 16 (local dev/test databases)
 
-## MongoDB: replica set required
-
-Transactions (vehicle/weighbridge/payment posting) require a replica set, even
-for a single server. Start a single-node replica set:
+## PostgreSQL: local setup
 
 ```bash
-# Data directory
-mkdir -p /path/to/mongo-data
-
-# Start mongod with replSet
-mongod --dbpath /path/to/mongo-data --bind_ip 127.0.0.1 --port 27017 --replSet rs0 --fork --logpath /path/to/mongod.log
-
-# Initiate the set (once)
-mongosh --eval 'rs.initiate({_id: "rs0", members: [{_id: 0, host: "127.0.0.1:27017"}]})'
+# Create the dev + test databases (example: role nakugaon)
+sudo -u postgres psql -c "CREATE ROLE nakugaon LOGIN PASSWORD 'change-me';"
+sudo -u postgres psql -c "CREATE DATABASE nakugaon_dev OWNER nakugaon;"
+sudo -u postgres psql -c "CREATE DATABASE nakugaon_test OWNER nakugaon;"
 ```
 
-Wait for `rs.status().ok === 1` before starting the server. If the server cannot
-reach a replica set, transaction writes fail loudly at startup checks — this is
-by design, so a charge can never half-post.
+Multi-write financial operations (vehicle/weighbridge/payment posting) run
+inside Prisma interactive transactions (`prisma.$transaction`), so a charge
+can never half-post. No replica set or special cluster mode is required —
+plain PostgreSQL works, locally and on Neon.
 
-Connection string form:
+Apply the schema with Prisma Migrate:
 
+```bash
+cd server
+npx prisma migrate dev        # creates/updates nakugaon_dev
 ```
-MONGODB_URI=mongodb://127.0.0.1:27017/nakugaon?replicaSet=rs0
+
+On networks where Prisma's postinstall engine download is blocked (Node fetch
+reset by an egress proxy), install with `--ignore-scripts` and fetch the
+engines with curl instead:
+
+```bash
+npm install --ignore-scripts
+./scripts/setup-engines.sh
+eval "$(./scripts/setup-engines.sh)"   # exports PRISMA_*_BINARY for the CLI
 ```
 
-For tests, the suite uses a separate database (`nakugaon_test`) on the same
-server; it drops and recreates its collections per run.
+For tests, the suite uses a separate database (`nakugaon_test`); it
+truncates all tables per run. Set `TEST_DATABASE_URL` to point at it, or
+accept the socket default documented in `server/tests/api.test.js`.
 
 ## Install
 
@@ -50,7 +56,7 @@ Edit `server/.env`:
 
 | Variable | Required | Notes |
 |---|---|---|
-| `MONGODB_URI` | yes | Include `?replicaSet=rs0` |
+| `DATABASE_URL` | yes | Postgres connection string, e.g. `postgresql://user:password@localhost:5432/nakugaon_dev` |
 | `PORT` | no | Default 4001 in the example |
 | `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET` | yes | Long random strings, different from each other |
 | `CLIENT_URL` | yes | Frontend origin, e.g. `http://localhost:5173` |
@@ -63,10 +69,9 @@ Edit `server/.env`:
 ## First admin
 
 ```bash
-ADMIN_PASSWORD='<redacted>' node server/scripts/create-admin.js
+ADMIN_PASSWORD='<redacted>' node server/scripts/create-admin.js "Full Name" admin@example.com
 ```
 
-Options via env: `ADMIN_NAME`, `ADMIN_EMAIL`, `ADMIN_PASSWORD` (min 8 chars).
 The script refuses to overwrite an existing admin with the same email.
 
 ## Run

@@ -2,13 +2,10 @@
 // NEVER run against a production database holding real member records.
 // Run: SEED_DEMO=true node scripts/seed.js
 import bcrypt from 'bcrypt';
-import mongoose from 'mongoose';
-import { connectDb } from '../src/config/db.js';
-import { Member } from '../src/models/Member.js';
-import { User } from '../src/models/User.js';
-import { FeeRule, DEFAULT_FEES } from '../src/models/FeeRule.js';
+import { prisma, disconnectDb } from '../src/config/db.js';
 import { ensureReferenceData } from '../src/services/referenceData.js';
-import { nextSeq } from '../src/models/Counter.js';
+import { nextSeq } from '../src/constants.js';
+import { DEFAULT_FEES } from '../src/constants.js';
 import { postCharge, postPayment } from '../src/services/ledgerService.js';
 
 if (process.env.SEED_DEMO !== 'true') {
@@ -26,32 +23,32 @@ const DEMO_MEMBERS = [
 ];
 
 async function main() {
-  await connectDb();
+  await prisma.$connect();
   await ensureReferenceData();
-  const session = await mongoose.startSession();
-  await session.withTransaction(async () => {
+  await prisma.$transaction(async (tx) => {
     for (const d of DEMO_MEMBERS) {
-      const seq = await nextSeq('member', session);
+      const seq = await nextSeq(tx, 'member');
       const memberId = `NAK-${String(seq).padStart(4, '0')}`;
-      const [member] = await Member.create([{
-        memberId, businessName: d.businessName, ownerName: d.ownerName, phone: d.phone,
-        address: d.address, joiningDate: new Date('2024-01-15'), openingBalance: 0,
-        outstandingBalance: 0, isDemo: true,
-      }], { session });
+      const member = await tx.member.create({
+        data: {
+          memberId, businessName: d.businessName, ownerName: d.ownerName, phone: d.phone,
+          address: d.address, joiningDate: new Date('2024-01-15'), openingBalance: 0,
+          outstandingBalance: 0, isDemo: true,
+        },
+      });
       // A few demo charges + one partial payment per member, through the real ledger.
-      await postCharge({ memberId: member._id, kind: 'VEHICLE_CHARGE', amount: 4 * DEFAULT_FEES.VEHICLE_PER_UNIT, reference: 'DEMO-VEH', referenceType: 'VehicleEntry', incomeAccount: 'VEHICLE_INCOME', occurredAt: new Date(), session });
-      await postCharge({ memberId: member._id, kind: 'WEIGHBRIDGE_CHARGE', amount: DEFAULT_FEES.WB_BD, reference: 'DEMO-WB', referenceType: 'WeighbridgeEntry', incomeAccount: 'WEIGHBRIDGE_INCOME', occurredAt: new Date(), session });
-      await postPayment({ memberId: member._id, amount: 100, reference: 'DEMO-PAY', referenceType: 'Payment', method: 'CASH', occurredAt: new Date(), session });
+      await postCharge({ memberId: member.id, kind: 'VEHICLE_CHARGE', amount: 4 * DEFAULT_FEES.VEHICLE_PER_UNIT, reference: 'DEMO-VEH', referenceType: 'VehicleEntry', incomeAccount: 'VEHICLE_INCOME', occurredAt: new Date(), tx });
+      await postCharge({ memberId: member.id, kind: 'WEIGHBRIDGE_CHARGE', amount: DEFAULT_FEES.WB_BD, reference: 'DEMO-WB', referenceType: 'WeighbridgeEntry', incomeAccount: 'WEIGHBRIDGE_INCOME', occurredAt: new Date(), tx });
+      await postPayment({ memberId: member.id, amount: 100, reference: 'DEMO-PAY', referenceType: 'Payment', method: 'CASH', occurredAt: new Date(), tx });
     }
   });
-  await session.endSession();
   // Demo super admin — DEMO ONLY. Real admins must use scripts/create-admin.js.
-  const existing = await User.findOne({ email: 'admin@nakugaon.local' });
+  const existing = await prisma.user.findUnique({ where: { email: 'admin@nakugaon.local' } });
   if (!existing) {
-    await User.create({ name: 'Demo Admin', email: 'admin@nakugaon.local', passwordHash: await bcrypt.hash('Nakugaon@123', 12), role: 'SUPER_ADMIN' });
+    await prisma.user.create({ data: { name: 'Demo Admin', email: 'admin@nakugaon.local', passwordHash: await bcrypt.hash('Nakugaon@123', 12), role: 'SUPER_ADMIN' } });
   }
   console.log('Demo seed complete: 6 fictional demo members, demo charges/payments, demo admin admin@nakugaon.local (DEMO ONLY).');
-  await mongoose.disconnect();
+  await disconnectDb();
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

@@ -1,8 +1,15 @@
-import mongoose from 'mongoose';
-import { env } from './env.js';
+import { PrismaClient } from '@prisma/client';
 
-export async function connectDb(uri = env.mongoUri) {
-  mongoose.set('strictQuery', true);
-  await mongoose.connect(uri);
-  return mongoose.connection;
+// Single shared Prisma client. The query engine binary is resolved from
+// node_modules/@prisma/engines (see scripts/setup-engines.sh, needed on
+// networks where Prisma's postinstall download is blocked).
+export const prisma = new PrismaClient();
+
+export async function connectDb() {
+  await prisma.$connect();
+  return prisma;
+}
+
+export async function disconnectDb() {
+  await prisma.$disconnect();
 }

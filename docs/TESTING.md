@@ -3,10 +3,11 @@
 ## Server suite (executed — green)
 
 ```bash
-cd server && npm test   # vitest + supertest against nakugaon_test
+cd server && npm test   # vitest + supertest against nakugaon_test (PostgreSQL)
 ```
 
-**Result at last run (2026-10-24): 18/18 tests pass.**
+**Result at last run (2026-10-24, after the MongoDB → PostgreSQL port):
+18/18 tests pass.**
 
 Coverage, mapped to the brief's required checks:
 
@@ -31,6 +32,14 @@ Coverage, mapped to the brief's required checks:
 One real bug was found and fixed by this suite: MEMBER users initially got
 403 on their own ledger because the role lacked the `ledger:read` permission
 — fixed by granting it with server-side scoping to the member's own record.
+
+**PostgreSQL port (2026-10-24):** the suite was ported from Mongoose to
+Prisma and re-run green (18/18) against a local Postgres test database. One
+further real bug surfaced in the demo-seed smoke test: FIFO payment
+allocations require a Payment record id, but direct ledger postings (the
+seed posts charges/payments without Payment rows) carry none — allocations
+are now skipped when no payment id exists (they are informational only; the
+ledger row remains authoritative). Tests were re-run green after the fix.
 
 ## Client checks (executed)
 

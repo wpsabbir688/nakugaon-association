@@ -1,14 +1,15 @@
 import jwt from 'jsonwebtoken';
 import crypto from 'node:crypto';
 import { env } from '../config/env.js';
-import { User, ROLE_PERMISSIONS } from '../models/User.js';
+import { prisma } from '../config/db.js';
+import { ROLE_PERMISSIONS } from '../constants.js';
 import { unauthorized, forbidden } from '../utils/errors.js';
 
 export function signAccessToken(user) {
-  return jwt.sign({ sub: user._id.toString(), role: user.role }, env.jwtAccessSecret, { expiresIn: '15m' });
+  return jwt.sign({ sub: user.id, role: user.role }, env.jwtAccessSecret, { expiresIn: '15m' });
 }
 export function signRefreshToken(user) {
-  return jwt.sign({ sub: user._id.toString(), type: 'refresh' }, env.jwtRefreshSecret, { expiresIn: '7d' });
+  return jwt.sign({ sub: user.id, type: 'refresh' }, env.jwtRefreshSecret, { expiresIn: '7d' });
 }
 export const hashToken = (t) => crypto.createHash('sha256').update(t).digest('hex');
 
@@ -32,7 +33,7 @@ export async function requireAuth(req, _res, next) {
     const token = header.startsWith('Bearer ') ? header.slice(7) : null;
     if (!token) return next(unauthorized());
     const payload = jwt.verify(token, env.jwtAccessSecret);
-    const user = await User.findById(payload.sub);
+    const user = await prisma.user.findUnique({ where: { id: payload.sub } });
     if (!user || !user.isActive) return next(unauthorized());
     req.user = user;
     return next();
@@ -65,9 +66,8 @@ export function requireOwnMemberOrStaff(param = 'memberId') {
   return async (req, _res, next) => {
     if (!req.user) return next(unauthorized());
     if (req.user.role !== 'MEMBER') return next();
-    const { Member } = await import('../models/Member.js');
-    const member = await Member.findOne({ memberId: req.params[param] });
-    if (!member || !req.user.memberId || !req.user.memberId.equals(member._id)) {
+    const member = await prisma.member.findUnique({ where: { memberId: req.params[param] } });
+    if (!member || !req.user.memberId || req.user.memberId !== member.id) {
       return next(forbidden('Members can only access their own records'));
     }
     return next();

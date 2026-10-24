@@ -1,0 +1,356 @@
+// Nakugaon Import & Export Owners Association — PostgreSQL schema (Prisma).
+// Money is ALWAYS integer Bangladeshi Taka. Never use floats for money.
+// IDs are opaque cuid strings; the API serializes them as `_id` (see
+// src/utils/serialize.js) so the public /api/v1 contract is unchanged from
+// the previous MongoDB implementation and the React client needs no changes.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  SUPER_ADMIN
+  MANAGER
+  ACCOUNTANT
+  OPERATOR
+  MEMBER
+}
+
+enum MemberStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum FeeCategory {
+  VEHICLE
+  WEIGHBRIDGE
+}
+
+enum WbCategory {
+  WB_BHUTAN
+  WB_BD
+  WB_LORRY
+  WB_TROLLEY
+}
+
+enum LedgerKind {
+  OPENING
+  VEHICLE_CHARGE
+  WEIGHBRIDGE_CHARGE
+  OTHER_CHARGE
+  PAYMENT
+  CREDIT
+  REVERSAL
+}
+
+enum PaymentMethod {
+  CASH
+  BANK
+  OTHER
+}
+
+enum PaymentStatus {
+  POSTED
+  REVERSED
+}
+
+enum EntryStatus {
+  POSTED
+  VOIDED
+}
+
+enum AccountType {
+  ASSET
+  INCOME
+  EXPENSE
+  LIABILITY
+}
+
+enum NoticeLanguage {
+  bn
+  en
+  both
+}
+
+model User {
+  id                 String   @id @default(cuid())
+  name               String
+  email              String   @unique
+  passwordHash       String
+  role               Role
+  member             Member?  @relation(fields: [memberId], references: [id])
+  memberId           String?
+  isActive           Boolean  @default(true)
+  refreshTokenHash   String?
+  resetTokenHash     String?
+  resetTokenExpiresAt DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  recordedVehicleEntries     VehicleEntry[]     @relation("RecordedVehicle")
+  recordedWeighbridgeEntries WeighbridgeEntry[] @relation("RecordedWeighbridge")
+  recordedLedgerEntries      LedgerEntry[]      @relation("RecordedLedger")
+  receivedPayments           Payment[]          @relation("ReceivedPayment")
+  recordedExpenses           Expense[]          @relation("RecordedExpense")
+  recordedJournals           JournalEntry[]     @relation("RecordedJournal")
+  createdNotices             Notice[]           @relation("CreatedNotice")
+  auditLogs                  AuditLog[]         @relation("AuditActor")
+
+  @@index([role])
+}
+
+model Member {
+  id                 String       @id @default(cuid())
+  memberId           String       @unique // NAK-0001 (public key)
+  businessName       String
+  ownerName          String
+  fatherName         String       @default("")
+  profileImageUrl    String       @default("")
+  address            String       @default("")
+  phone              String       @default("")
+  joiningDate        DateTime
+  status             MemberStatus @default(ACTIVE)
+  registrationInfo   String       @default("")
+  notes              String       @default("") // private staff notes, never public
+  openingBalance     Int          @default(0)
+  // Transactionally maintained cache of the ledger-derived balance.
+  // The ledger itself is the source of truth; /admin/reconcile recomputes it.
+  outstandingBalance Int          @default(0)
+  isDemo             Boolean      @default(false)
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  users              User[]
+  vehicleEntries     VehicleEntry[]
+  weighbridgeEntries WeighbridgeEntry[]
+  ledgerEntries      LedgerEntry[]
+  payments           Payment[]
+
+  @@index([status])
+  @@index([businessName, ownerName, memberId])
+}
+
+// Atomic sequence counter (member IDs, receipt numbers). Inside a Prisma
+// interactive transaction, the upsert-increment below serializes on the row,
+// so sequence values are never duplicated even under concurrency.
+model Counter {
+  key String @id
+  seq Int    @default(0)
+}
+
+model FeeRule {
+  id        String      @id @default(cuid())
+  key       String      @unique // VEHICLE_PER_UNIT, WB_BHUTAN, WB_BD, WB_LORRY, WB_TROLLEY
+  label     String
+  category  FeeCategory
+  amount    Int
+  isActive  Boolean     @default(true)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+}
+
+model VehicleEntry {
+  id              String    @id @default(cuid())
+  member          Member    @relation(fields: [memberId], references: [id])
+  memberId        String
+  entryDate       DateTime
+  quantity        Int
+  feePerVehicle   Int // snapshot — never rewritten when the rule changes
+  total           Int
+  notes           String    @default("")
+  recordedBy      User?     @relation("RecordedVehicle", fields: [recordedById], references: [id])
+  recordedById    String?
+  idempotencyKey  String?   @unique
+  ledgerEntry     LedgerEntry? @relation("VehicleLedger", fields: [ledgerEntryId], references: [id])
+  ledgerEntryId   String?   @unique
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([memberId])
+  @@index([entryDate])
+}
+
+model WeighbridgeEntry {
+  id              String      @id @default(cuid())
+  member          Member      @relation(fields: [memberId], references: [id])
+  memberId        String
+  occurredAt      DateTime
+  category        WbCategory
+  fee             Int // snapshot — never rewritten when the rule changes
+  weightKg        Float?
+  referenceNumber String      @default("")
+  operator        String      @default("")
+  notes           String      @default("")
+  status          EntryStatus @default(POSTED)
+  recordedBy      User?       @relation("RecordedWeighbridge", fields: [recordedById], references: [id])
+  recordedById    String?
+  idempotencyKey  String?     @unique
+  ledgerEntry     LedgerEntry? @relation("WeighbridgeLedger", fields: [ledgerEntryId], references: [id])
+  ledgerEntryId   String?     @unique
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  @@index([memberId])
+  @@index([occurredAt])
+}
+
+model LedgerEntry {
+  id              String      @id @default(cuid())
+  member          Member      @relation(fields: [memberId], references: [id])
+  memberId        String
+  kind            LedgerKind
+  // Signed effect on the outstanding balance: charges +, payments/credits -.
+  amount          Int
+  runningBalance  Int
+  reference       String      @default("")
+  referenceType   String      @default("")
+  referenceId     String?
+  reversalOf      LedgerEntry? @relation("LedgerReversal", fields: [reversalOfId], references: [id])
+  reversalOfId    String?     @unique
+  reversalReason  String      @default("")
+  idempotencyKey  String?
+  recordedBy      User?       @relation("RecordedLedger", fields: [recordedById], references: [id])
+  recordedById    String?
+  occurredAt      DateTime    @default(now())
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  reversedBy      LedgerEntry? @relation("LedgerReversal")
+  vehicleEntry    VehicleEntry? @relation("VehicleLedger")
+  weighbridgeEntry WeighbridgeEntry? @relation("WeighbridgeLedger")
+  payment         Payment?     @relation("PaymentLedger")
+  allocations     PaymentAllocation[]
+
+  @@index([memberId])
+  @@index([occurredAt])
+  @@index([memberId, occurredAt])
+}
+
+model Payment {
+  id              String        @id @default(cuid())
+  member          Member        @relation(fields: [memberId], references: [id])
+  memberId        String
+  amount          Int
+  paidAt          DateTime
+  method          PaymentMethod
+  receiptNumber   String        @unique
+  reference       String        @default("")
+  receivedBy      User?         @relation("ReceivedPayment", fields: [receivedById], references: [id])
+  receivedById    String?
+  notes           String        @default("")
+  status          PaymentStatus @default(POSTED)
+  idempotencyKey  String?       @unique
+  ledgerEntry     LedgerEntry?  @relation("PaymentLedger", fields: [ledgerEntryId], references: [id])
+  ledgerEntryId   String?       @unique
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  allocations     PaymentAllocation[]
+
+  @@index([memberId])
+  @@index([paidAt])
+}
+
+// Payment allocation policy (documented in README): a payment is applied to
+// the oldest outstanding charges first (FIFO). Allocations are informational
+// records; the ledger entry is the authoritative financial record.
+model PaymentAllocation {
+  id            String      @id @default(cuid())
+  payment       Payment     @relation(fields: [paymentId], references: [id])
+  paymentId     String
+  ledgerEntry   LedgerEntry @relation(fields: [ledgerEntryId], references: [id])
+  ledgerEntryId String
+  amount        Int
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([ledgerEntryId])
+}
+
+model Account {
+  id        String      @id @default(cuid())
+  code      String      @unique // RECEIVABLE, VEHICLE_INCOME, ...
+  name      String
+  type      AccountType
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+}
+
+// Double-entry journal: every entry's lines MUST balance (debits == credits).
+// Lines are stored as JSON (they were an embedded subdocument before) with
+// shape [{ accountCode, debit, credit }].
+model JournalEntry {
+  id            String        @id @default(cuid())
+  description   String
+  lines         Json
+  referenceType String        @default("")
+  referenceId   String?
+  reversalOf    JournalEntry? @relation("JournalReversal", fields: [reversalOfId], references: [id])
+  reversalOfId  String?       @unique
+  recordedBy    User?         @relation("RecordedJournal", fields: [recordedById], references: [id])
+  recordedById  String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  reversedBy    JournalEntry? @relation("JournalReversal")
+}
+
+model Expense {
+  id           String        @id @default(cuid())
+  title        String
+  amount       Int
+  spentAt      DateTime
+  method       PaymentMethod @default(CASH)
+  category     String        @default("")
+  notes        String        @default("")
+  recordedBy   User?         @relation("RecordedExpense", fields: [recordedById], references: [id])
+  recordedById String?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([spentAt])
+}
+
+model Notice {
+  id          String         @id @default(cuid())
+  title       String
+  body        String
+  language    NoticeLanguage @default(both)
+  isPublished Boolean        @default(false)
+  publishedAt DateTime?
+  createdBy   User?          @relation("CreatedNotice", fields: [createdById], references: [id])
+  createdById String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+}
+
+// Configurable site information. Official contact details, registration
+// numbers, and statistics are NEVER invented — these stay empty until the
+// association fills them in from its own records (see README).
+model SiteSetting {
+  key       String   @id
+  value     Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actor     User?    @relation("AuditActor", fields: [actorId], references: [id])
+  actorId   String?
+  actorName String   @default("system")
+  action    String
+  entity    String   @default("")
+  entityId  String   @default("")
+  details   Json     @default("{}")
+  ipAddress String   @default("")
+  createdAt DateTime @default(now())
+
+  @@index([action])
+  @@index([createdAt])
+}

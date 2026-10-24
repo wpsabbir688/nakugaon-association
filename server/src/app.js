@@ -4,6 +4,7 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import path from 'node:path';
 import { env } from './config/env.js';
+import { prisma } from './config/db.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { apiLimiter } from './middleware/rateLimit.js';
 import { authRouter } from './routes/auth.js';
@@ -17,7 +18,6 @@ import { reportsRouter } from './routes/reports.js';
 import { noticesRouter, settingsRouter, auditRouter } from './routes/notices.js';
 import { adminRouter } from './routes/admin.js';
 import { expensesRouter } from './routes/expenses.js';
-import mongoose from 'mongoose';
 
 export function createApp() {
   const app = express();
@@ -32,7 +32,7 @@ export function createApp() {
 
   app.get('/health', async (_req, res) => {
     try {
-      await mongoose.connection.db.admin().ping();
+      await prisma.$queryRaw`SELECT 1`;
       res.json({ ok: true, db: 'up' });
     } catch {
       res.status(503).json({ ok: false, db: 'down' });

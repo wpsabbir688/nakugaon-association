@@ -1,17 +1,16 @@
 import express from 'express';
-import mongoose from 'mongoose';
 import multer from 'multer';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { z } from 'zod';
-import { Member } from '../models/Member.js';
-import { LedgerEntry } from '../models/LedgerEntry.js';
-import { nextSeq } from '../models/Counter.js';
-import { requireAuth, requirePermission, requireOwnMemberOrStaff } from '../middleware/auth.js';
-import { validate, paginationQuery, paginate, pageMeta, safeSearchRegex } from '../middleware/validate.js';
+import { prisma } from '../config/db.js';
+import { nextSeq } from '../constants.js';
+import { requireAuth, requirePermission } from '../middleware/auth.js';
+import { validate, paginationQuery, paginate, pageMeta, searchFilter } from '../middleware/validate.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
 import { notFound, badRequest, forbidden } from '../utils/errors.js';
 import { audit, computeBalance } from '../services/ledgerService.js';
+import { withId, withIdList } from '../utils/serialize.js';
 import { env } from '../config/env.js';
 
 export const membersRouter = express.Router();
@@ -41,42 +40,41 @@ const memberBody = z.object({
   openingBalance: z.number().int().min(0).optional().default(0),
 });
 
+function ownMemberGuard(req, member) {
+  if (req.user.role === 'MEMBER' && (!req.user.memberId || req.user.memberId !== member.id)) throw forbidden();
+}
+
 membersRouter.get('/', requireAuth, requirePermission('members:read'), validate({ query: paginationQuery.extend({ status: z.enum(['ACTIVE', 'ARCHIVED']).optional() }) }), asyncHandler(async (req, res) => {
   const { page, limit, skip } = paginate(req.query);
-  const filter = {};
+  const where = {};
   if (req.user.role === 'MEMBER') {
     // Members may only ever see their own record, even via the list endpoint.
     if (!req.user.memberId) return res.json({ members: [], meta: pageMeta(0, page, limit) });
-    filter._id = req.user.memberId;
+    where.id = req.user.memberId;
   } else {
-    if (req.query.status) filter.status = req.query.status;
-    if (req.query.search) {
-      const rx = safeSearchRegex(req.query.search);
-      filter.$or = [{ businessName: rx }, { ownerName: rx }, { memberId: rx }];
-    }
+    if (req.query.status) where.status = req.query.status;
+    if (req.query.search) Object.assign(where, searchFilter(req.query.search, ['businessName', 'ownerName', 'memberId']));
   }
   const [total, members] = await Promise.all([
-    Member.countDocuments(filter),
-    Member.find(filter).sort({ memberId: 1 }).skip(skip).limit(limit),
+    prisma.member.count({ where }),
+    prisma.member.findMany({ where, orderBy: { memberId: 'asc' }, skip, take: limit }),
   ]);
-  res.json({ members, meta: pageMeta(total, page, limit) });
+  res.json({ members: withIdList(members), meta: pageMeta(total, page, limit) });
 }));
 
 membersRouter.get('/:memberId', requireAuth, requirePermission('members:read'), asyncHandler(async (req, res) => {
-  const m = await Member.findOne({ memberId: req.params.memberId });
+  const m = await prisma.member.findUnique({ where: { memberId: req.params.memberId } });
   if (!m) throw notFound('Member not found');
-  if (req.user.role === 'MEMBER' && (!req.user.memberId || !req.user.memberId.equals(m._id))) throw forbidden();
-  res.json({ member: m });
+  ownMemberGuard(req, m);
+  res.json({ member: withId(m) });
 }));
 
 membersRouter.post('/', requireAuth, requirePermission('members:write'), validate({ body: memberBody }), asyncHandler(async (req, res) => {
-  const session = await mongoose.startSession();
-  let member;
-  try {
-    await session.withTransaction(async () => {
-      const seq = await nextSeq('member', session);
-      const memberId = `NAK-${String(seq).padStart(4, '0')}`;
-      const [doc] = await Member.create([{
+  const member = await prisma.$transaction(async (tx) => {
+    const seq = await nextSeq(tx, 'member');
+    const memberId = `NAK-${String(seq).padStart(4, '0')}`;
+    const doc = await tx.member.create({
+      data: {
         memberId,
         businessName: req.body.businessName,
         ownerName: req.body.ownerName,
@@ -87,65 +85,73 @@ membersRouter.post('/', requireAuth, requirePermission('members:write'), validat
         registrationInfo: req.body.registrationInfo,
         openingBalance: req.body.openingBalance,
         outstandingBalance: req.body.openingBalance,
-      }], { session });
-      member = doc;
-      if (req.body.openingBalance > 0) {
-        await LedgerEntry.create([{
-          member: doc._id, kind: 'OPENING', amount: req.body.openingBalance,
-          runningBalance: req.body.openingBalance, reference: 'OPENING',
-        }], { session });
-      }
+      },
     });
-  } finally {
-    await session.endSession();
-  }
-  await audit({ actor: req.user._id, actorName: req.user.name, action: 'member.create', entity: 'Member', entityId: member.memberId, ipAddress: req.ip });
-  res.status(201).json({ member });
+    if (req.body.openingBalance > 0) {
+      await tx.ledgerEntry.create({
+        data: { memberId: doc.id, kind: 'OPENING', amount: req.body.openingBalance, runningBalance: req.body.openingBalance, reference: 'OPENING' },
+      });
+    }
+    return doc;
+  });
+  await audit({ actor: req.user.id, actorName: req.user.name, action: 'member.create', entity: 'Member', entityId: member.memberId, ipAddress: req.ip });
+  res.status(201).json({ member: withId(member) });
 }));
 
 membersRouter.patch('/:memberId', requireAuth, requirePermission('members:write'), validate({ body: memberBody.partial().omit({ openingBalance: true }) }), asyncHandler(async (req, res) => {
-  const m = await Member.findOneAndUpdate({ memberId: req.params.memberId }, { $set: req.body }, { new: true });
-  if (!m) throw notFound('Member not found');
-  await audit({ actor: req.user._id, actorName: req.user.name, action: 'member.update', entity: 'Member', entityId: m.memberId, ipAddress: req.ip });
-  res.json({ member: m });
+  const data = { ...req.body };
+  if (data.joiningDate) data.joiningDate = new Date(data.joiningDate);
+  let m;
+  try {
+    m = await prisma.member.update({ where: { memberId: req.params.memberId }, data });
+  } catch (err) {
+    if (err?.code === 'P2025') throw notFound('Member not found');
+    throw err;
+  }
+  await audit({ actor: req.user.id, actorName: req.user.name, action: 'member.update', entity: 'Member', entityId: m.memberId, ipAddress: req.ip });
+  res.json({ member: withId(m) });
 }));
 
 membersRouter.post('/:memberId/archive', requireAuth, requirePermission('members:archive'), asyncHandler(async (req, res) => {
-  const m = await Member.findOneAndUpdate({ memberId: req.params.memberId }, { $set: { status: 'ARCHIVED' } }, { new: true });
-  if (!m) throw notFound('Member not found');
-  await audit({ actor: req.user._id, actorName: req.user.name, action: 'member.archive', entity: 'Member', entityId: m.memberId, ipAddress: req.ip });
-  res.json({ member: m });
+  let m;
+  try {
+    m = await prisma.member.update({ where: { memberId: req.params.memberId }, data: { status: 'ARCHIVED' } });
+  } catch (err) {
+    if (err?.code === 'P2025') throw notFound('Member not found');
+    throw err;
+  }
+  await audit({ actor: req.user.id, actorName: req.user.name, action: 'member.archive', entity: 'Member', entityId: m.memberId, ipAddress: req.ip });
+  res.json({ member: withId(m) });
 }));
 
 membersRouter.post('/:memberId/photo', requireAuth, requirePermission('members:write'), upload.single('photo'), asyncHandler(async (req, res) => {
   if (!req.file) throw badRequest('No image uploaded');
-  const m = await Member.findOneAndUpdate(
-    { memberId: req.params.memberId },
-    { $set: { profileImageUrl: `/uploads/${req.file.filename}` } },
-    { new: true }
-  );
-  if (!m) throw notFound('Member not found');
+  let m;
+  try {
+    m = await prisma.member.update({ where: { memberId: req.params.memberId }, data: { profileImageUrl: `/uploads/${req.file.filename}` } });
+  } catch (err) {
+    if (err?.code === 'P2025') throw notFound('Member not found');
+    throw err;
+  }
   res.json({ profileImageUrl: m.profileImageUrl });
 }));
 
 membersRouter.get('/:memberId/ledger', requireAuth, requirePermission('ledger:read'), validate({ query: paginationQuery }), asyncHandler(async (req, res) => {
-  const m = await Member.findOne({ memberId: req.params.memberId });
+  const m = await prisma.member.findUnique({ where: { memberId: req.params.memberId } });
   if (!m) throw notFound('Member not found');
-  if (req.user.role === 'MEMBER' && (!req.user.memberId || !req.user.memberId.equals(m._id))) throw forbidden();
+  ownMemberGuard(req, m);
   const { page, limit, skip } = paginate(req.query);
   const [total, rows] = await Promise.all([
-    LedgerEntry.countDocuments({ member: m._id }),
-    LedgerEntry.find({ member: m._id }).sort({ occurredAt: -1, createdAt: -1 }).skip(skip).limit(limit),
+    prisma.ledgerEntry.count({ where: { memberId: m.id } }),
+    prisma.ledgerEntry.findMany({ where: { memberId: m.id }, orderBy: [{ occurredAt: 'desc' }, { createdAt: 'desc' }], skip, take: limit }),
   ]);
-  res.json({ rows, meta: pageMeta(total, page, limit) });
+  res.json({ rows: withIdList(rows), meta: pageMeta(total, page, limit) });
 }));
 
 membersRouter.get('/:memberId/balance', requireAuth, requirePermission('ledger:read'), asyncHandler(async (req, res) => {
-  const m = await Member.findOne({ memberId: req.params.memberId });
+  const m = await prisma.member.findUnique({ where: { memberId: req.params.memberId } });
   if (!m) throw notFound('Member not found');
-  if (req.user.role === 'MEMBER' && (!req.user.memberId || !req.user.memberId.equals(m._id))) throw forbidden();
-  const computed = await computeBalance(m._id);
+  ownMemberGuard(req, m);
+  const computed = await computeBalance(m.id);
   res.json({ memberId: m.memberId, cachedBalance: m.outstandingBalance, computedBalance: computed, inSync: computed === m.outstandingBalance, openingBalance: m.openingBalance });
 }));
-
-void requireOwnMemberOrStaff;

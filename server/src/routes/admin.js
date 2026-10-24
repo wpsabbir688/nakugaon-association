@@ -1,16 +1,13 @@
 import express from 'express';
 import bcrypt from 'bcrypt';
 import { z } from 'zod';
-import { Member } from '../models/Member.js';
-import { VehicleEntry, WeighbridgeEntry } from '../models/Entries.js';
-import { Payment, Expense } from '../models/Payments.js';
-import { LedgerEntry } from '../models/LedgerEntry.js';
-import { User } from '../models/User.js';
+import { prisma } from '../config/db.js';
 import { requireAuth, requireRole, requirePermission } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
 import { notFound, badRequest } from '../utils/errors.js';
 import { audit, reconcileAll } from '../services/ledgerService.js';
+import { withId, withIdList, memberRef, safeUser } from '../utils/serialize.js';
 
 export const adminRouter = express.Router();
 
@@ -24,78 +21,85 @@ function dayRange(dateStr) {
 
 adminRouter.get('/dashboard', requireAuth, requirePermission('reports:read'), asyncHandler(async (req, res) => {
   const { start, end } = dayRange(req.query.date);
-  const [activeMembers, todayVehicles, todayVehicleCharges, todayWbCharges, todayPayments, outstandingAgg, recentTx, recentMembers] = await Promise.all([
-    Member.countDocuments({ status: 'ACTIVE' }),
-    VehicleEntry.aggregate([{ $match: { entryDate: { $gte: start, $lt: end } } }, { $group: { _id: null, count: { $sum: '$quantity' }, amount: { $sum: '$total' } } }]),
-    VehicleEntry.aggregate([{ $match: { entryDate: { $gte: start, $lt: end } } }, { $group: { _id: null, total: { $sum: '$total' } } }]),
-    WeighbridgeEntry.aggregate([{ $match: { occurredAt: { $gte: start, $lt: end }, status: 'POSTED' } }, { $group: { _id: null, total: { $sum: '$fee' } } }]),
-    Payment.aggregate([{ $match: { paidAt: { $gte: start, $lt: end }, status: 'POSTED' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-    Member.aggregate([{ $match: { status: 'ACTIVE' } }, { $group: { _id: null, total: { $sum: '$outstandingBalance' } } }]),
-    LedgerEntry.find({}).sort({ occurredAt: -1, createdAt: -1 }).limit(10).populate('member', 'memberId businessName'),
-    Member.find({}).sort({ createdAt: -1 }).limit(5),
+  const [activeMembers, todayVehicleAgg, todayWbAgg, todayPaymentAgg, outstandingAgg, recentTx, recentMembers] = await Promise.all([
+    prisma.member.count({ where: { status: 'ACTIVE' } }),
+    prisma.vehicleEntry.aggregate({ where: { entryDate: { gte: start, lt: end } }, _sum: { quantity: true, total: true } }),
+    prisma.weighbridgeEntry.aggregate({ where: { occurredAt: { gte: start, lt: end }, status: 'POSTED' }, _sum: { fee: true } }),
+    prisma.payment.aggregate({ where: { paidAt: { gte: start, lt: end }, status: 'POSTED' }, _sum: { amount: true } }),
+    prisma.member.aggregate({ where: { status: 'ACTIVE' }, _sum: { outstandingBalance: true } }),
+    prisma.ledgerEntry.findMany({ orderBy: [{ occurredAt: 'desc' }, { createdAt: 'desc' }], take: 10, include: { member: { select: { id: true, memberId: true, businessName: true, ownerName: true } } } }),
+    prisma.member.findMany({ orderBy: { createdAt: 'desc' }, take: 5 }),
   ]);
   // Daily vehicle trend (last 14 days) + weighbridge by category + payment trend.
   const since = new Date();
   since.setDate(since.getDate() - 14);
-  const [vehicleTrend, wbByCategory, paymentTrend, topOutstanding] = await Promise.all([
-    VehicleEntry.aggregate([
-      { $match: { entryDate: { $gte: since } } },
-      { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$entryDate' } }, vehicles: { $sum: '$quantity' }, amount: { $sum: '$total' } } },
-      { $sort: { _id: 1 } },
-    ]),
-    WeighbridgeEntry.aggregate([
-      { $match: { status: 'POSTED' } },
-      { $group: { _id: '$category', total: { $sum: '$fee' }, count: { $sum: 1 } } },
-    ]),
-    Payment.aggregate([
-      { $match: { status: 'POSTED', paidAt: { $gte: since } } },
-      { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$paidAt' } }, total: { $sum: '$amount' } } },
-      { $sort: { _id: 1 } },
-    ]),
-    Member.find({ status: 'ACTIVE' }).sort({ outstandingBalance: -1 }).limit(10),
+  const [vehicleTrendRaw, wbByCategoryRaw, paymentTrendRaw, topOutstanding] = await Promise.all([
+    prisma.$queryRaw`
+      SELECT TO_CHAR("entryDate", 'YYYY-MM-DD') AS date, SUM("quantity") AS vehicles, SUM("total") AS amount
+      FROM "VehicleEntry" WHERE "entryDate" >= ${since} GROUP BY date ORDER BY date`,
+    prisma.weighbridgeEntry.groupBy({ by: ['category'], where: { status: 'POSTED' }, _sum: { fee: true }, _count: { _all: true } }),
+    prisma.$queryRaw`
+      SELECT TO_CHAR("paidAt", 'YYYY-MM-DD') AS date, SUM("amount") AS total
+      FROM "Payment" WHERE "status" = 'POSTED' AND "paidAt" >= ${since} GROUP BY date ORDER BY date`,
+    prisma.member.findMany({ where: { status: 'ACTIVE' }, orderBy: { outstandingBalance: 'desc' }, take: 10 }),
   ]);
+  const vehicleTrend = vehicleTrendRaw.map((r) => ({ _id: r.date, vehicles: Number(r.vehicles), amount: Number(r.amount) }));
+  const wbByCategory = wbByCategoryRaw.map((r) => ({ _id: r.category, total: r._sum.fee || 0, count: r._count._all }));
+  const paymentTrend = paymentTrendRaw.map((r) => ({ _id: r.date, total: Number(r.total) }));
+  const recentTransactions = recentTx.map((t) => {
+    const row = withId(t);
+    row.member = memberRef(t.member);
+    return row;
+  });
   res.json({
     activeMembers,
-    todayVehicleCount: todayVehicles[0]?.count || 0,
-    todayVehicleCharges: todayVehicleCharges[0]?.total || 0,
-    todayWeighbridgeCharges: todayWbCharges[0]?.total || 0,
-    todayPayments: todayPayments[0]?.total || 0,
-    totalOutstanding: outstandingAgg[0]?.total || 0,
-    recentTransactions: recentTx,
-    recentMembers,
+    todayVehicleCount: todayVehicleAgg._sum.quantity || 0,
+    todayVehicleCharges: todayVehicleAgg._sum.total || 0,
+    todayWeighbridgeCharges: todayWbAgg._sum.fee || 0,
+    todayPayments: todayPaymentAgg._sum.amount || 0,
+    totalOutstanding: outstandingAgg._sum.outstandingBalance || 0,
+    recentTransactions,
+    recentMembers: withIdList(recentMembers),
     charts: { vehicleTrend, wbByCategory, paymentTrend, topOutstanding: topOutstanding.map((m) => ({ memberId: m.memberId, businessName: m.businessName, outstandingBalance: m.outstandingBalance })) },
   });
 }));
 
 adminRouter.get('/users', requireAuth, requireRole('SUPER_ADMIN'), asyncHandler(async (_req, res) => {
-  const users = await User.find({}).select('-passwordHash -refreshTokenHash').sort({ createdAt: -1 });
-  res.json({ users });
+  const users = await prisma.user.findMany({ orderBy: { createdAt: 'desc' } });
+  res.json({ users: users.map(safeUser) });
 }));
 
 adminRouter.post('/users', requireAuth, requireRole('SUPER_ADMIN'), validate({ body: z.object({ name: z.string().min(1), email: z.string().email(), password: z.string().min(8), role: z.enum(['SUPER_ADMIN', 'MANAGER', 'ACCOUNTANT', 'OPERATOR', 'MEMBER']), memberId: z.string().optional() }) }), asyncHandler(async (req, res) => {
   let linkedMember = null;
   if (req.body.memberId) {
-    linkedMember = await Member.findOne({ memberId: req.body.memberId });
+    linkedMember = await prisma.member.findUnique({ where: { memberId: req.body.memberId } });
     if (!linkedMember) throw notFound('Member not found for linking');
   }
-  const user = await User.create({
-    name: req.body.name, email: req.body.email,
-    passwordHash: await bcrypt.hash(req.body.password, 12),
-    role: req.body.role, memberId: linkedMember?._id || null,
+  const user = await prisma.user.create({
+    data: {
+      name: req.body.name, email: req.body.email.toLowerCase(),
+      passwordHash: await bcrypt.hash(req.body.password, 12),
+      role: req.body.role, memberId: linkedMember?.id || null,
+    },
   });
-  await audit({ actor: req.user._id, actorName: req.user.name, action: 'user.create', entity: 'User', entityId: user._id.toString(), ipAddress: req.ip });
-  res.status(201).json({ user: { id: user._id, name: user.name, email: user.email, role: user.role } });
+  await audit({ actor: req.user.id, actorName: req.user.name, action: 'user.create', entity: 'User', entityId: user.id, ipAddress: req.ip });
+  res.status(201).json({ user: { id: user.id, name: user.name, email: user.email, role: user.role } });
 }));
 
 adminRouter.post('/reconcile', requireAuth, requireRole('SUPER_ADMIN'), asyncHandler(async (req, res) => {
   const result = await reconcileAll();
-  await audit({ actor: req.user._id, actorName: req.user.name, action: 'ledger.reconcile', entity: 'Member', details: result, ipAddress: req.ip });
+  await audit({ actor: req.user.id, actorName: req.user.name, action: 'ledger.reconcile', entity: 'Member', details: result, ipAddress: req.ip });
   res.json(result);
 }));
 
 adminRouter.patch('/users/:id/status', requireAuth, requireRole('SUPER_ADMIN'), validate({ body: z.object({ isActive: z.boolean() }) }), asyncHandler(async (req, res) => {
-  if (req.params.id === req.user._id.toString()) throw badRequest('You cannot deactivate yourself');
-  const user = await User.findByIdAndUpdate(req.params.id, { $set: { isActive: req.body.isActive } }, { new: true });
-  if (!user) throw notFound('User not found');
-  res.json({ user: { id: user._id, isActive: user.isActive } });
+  if (req.params.id === req.user.id) throw badRequest('You cannot deactivate yourself');
+  let user;
+  try {
+    user = await prisma.user.update({ where: { id: req.params.id }, data: { isActive: req.body.isActive } });
+  } catch (err) {
+    if (err?.code === 'P2025') throw notFound('User not found');
+    throw err;
+  }
+  res.json({ user: { id: user.id, isActive: user.isActive } });
 }));

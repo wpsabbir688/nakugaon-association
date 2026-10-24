@@ -1,102 +1,100 @@
-import mongoose from 'mongoose';
-import { Member } from '../models/Member.js';
-import { LedgerEntry } from '../models/LedgerEntry.js';
-import { JournalEntry } from '../models/Account.js';
-import { AuditLog } from '../models/Misc.js';
+import { prisma } from '../config/db.js';
 import { badRequest } from '../utils/errors.js';
 
-export async function audit({ actor, actorName, action, entity, entityId, details, ipAddress, session }) {
-  await AuditLog.create(
-    [{ actor: actor || null, actorName: actorName || 'system', action, entity: entity || '', entityId: entityId || '', details: details || {}, ipAddress: ipAddress || '' }],
-    { session: session || null }
-  );
+// `tx` is either the shared prisma client (single writes) or a Prisma
+// transaction client (multi-write financial operations). Callers inside a
+// transaction pass their tx; everything else defaults to prisma.
+export async function audit({ actor, actorName, action, entity, entityId, details, ipAddress, tx }) {
+  const db = tx || prisma;
+  await db.auditLog.create({
+    data: { actorId: actor || null, actorName: actorName || 'system', action, entity: entity || '', entityId: entityId || '', details: details || {}, ipAddress: ipAddress || '' },
+  });
 }
 
 // Recompute a member's balance purely from ledger rows + opening balance.
-export async function computeBalance(memberId, session = null) {
-  const member = await Member.findById(memberId).session(session);
+export async function computeBalance(memberId, tx = null) {
+  const db = tx || prisma;
+  const member = await db.member.findUnique({ where: { id: memberId } });
   if (!member) throw badRequest('Member not found');
-  const agg = await LedgerEntry.aggregate([
-    { $match: { member: member._id } },
-    { $group: { _id: null, total: { $sum: '$amount' } } },
-  ]).session(session);
-  return member.openingBalance + (agg[0]?.total || 0);
+  const agg = await db.ledgerEntry.aggregate({ where: { memberId: member.id }, _sum: { amount: true } });
+  return member.openingBalance + (agg._sum.amount || 0);
 }
 
 // Post a balanced journal entry (debits must equal credits).
-export async function postJournal({ description, lines, referenceType, referenceId, recordedBy, session }) {
+export async function postJournal({ description, lines, referenceType, referenceId, recordedBy, tx }) {
+  const db = tx || prisma;
   const debit = lines.reduce((s, l) => s + (l.debit || 0), 0);
   const credit = lines.reduce((s, l) => s + (l.credit || 0), 0);
   if (debit !== credit || debit <= 0) throw badRequest('Journal entry must balance with positive totals');
-  const [entry] = await JournalEntry.create(
-    [{ description, lines, referenceType: referenceType || '', referenceId: referenceId || null, recordedBy: recordedBy || null }],
-    { session }
-  );
-  return entry;
+  return db.journalEntry.create({
+    data: { description, lines, referenceType: referenceType || '', referenceId: referenceId || null, recordedById: recordedBy || null },
+  });
 }
 
 // Append a ledger row and transactionally refresh the member's cached balance.
-// Callers run this inside a mongoose session transaction.
-export async function appendLedger({ memberId, kind, amount, reference, referenceType, referenceId, idempotencyKey, recordedBy, occurredAt, session }) {
-  const balance = await computeBalance(memberId, session);
+// Callers run this inside a Prisma interactive transaction.
+export async function appendLedger({ memberId, kind, amount, reference, referenceType, referenceId, idempotencyKey, recordedBy, occurredAt, tx }) {
+  const db = tx || prisma;
+  const balance = await computeBalance(memberId, db);
   const runningBalance = balance + amount;
-  const [entry] = await LedgerEntry.create(
-    [{
-      member: memberId, kind, amount, runningBalance,
+  const entry = await db.ledgerEntry.create({
+    data: {
+      memberId, kind, amount, runningBalance,
       reference: reference || '', referenceType: referenceType || '',
       referenceId: referenceId || null, idempotencyKey: idempotencyKey || null,
-      recordedBy: recordedBy || null, occurredAt: occurredAt || new Date(),
-    }],
-    { session }
-  );
-  await Member.updateOne({ _id: memberId }, { $set: { outstandingBalance: runningBalance } }, { session });
+      recordedById: recordedBy || null, occurredAt: occurredAt || new Date(),
+    },
+  });
+  await db.member.update({ where: { id: memberId }, data: { outstandingBalance: runningBalance } });
   return entry;
 }
 
 // Post a charge: ledger row + balanced journal (Dr Receivable / Cr Fee Income).
-export async function postCharge({ memberId, kind, amount, reference, referenceType, referenceId, incomeAccount, recordedBy, occurredAt, idempotencyKey, session }) {
-  const ledger = await appendLedger({ memberId, kind, amount, reference, referenceType, referenceId, idempotencyKey, recordedBy, occurredAt, session });
+export async function postCharge({ memberId, kind, amount, reference, referenceType, referenceId, incomeAccount, recordedBy, occurredAt, idempotencyKey, tx }) {
+  const db = tx || prisma;
+  const ledger = await appendLedger({ memberId, kind, amount, reference, referenceType, referenceId, idempotencyKey, recordedBy, occurredAt, tx: db });
   await postJournal({
     description: `${kind} ${reference || ''}`.trim(),
     lines: [
       { accountCode: 'RECEIVABLE', debit: amount, credit: 0 },
       { accountCode: incomeAccount, debit: 0, credit: amount },
     ],
-    referenceType, referenceId, recordedBy, session,
+    referenceType, referenceId, recordedBy, tx: db,
   });
   return ledger;
 }
 
 // Post a payment: ledger row (negative) + journal (Dr Cash/Bank / Cr Receivable)
 // + FIFO allocation records against the oldest outstanding charge rows.
-export async function postPayment({ memberId, amount, reference, referenceType, referenceId, method, recordedBy, occurredAt, idempotencyKey, session }) {
-  const ledger = await appendLedger({ memberId, kind: 'PAYMENT', amount: -amount, reference, referenceType, referenceId, idempotencyKey, recordedBy, occurredAt, session });
+export async function postPayment({ memberId, amount, reference, referenceType, referenceId, method, recordedBy, occurredAt, idempotencyKey, tx }) {
+  const db = tx || prisma;
+  const ledger = await appendLedger({ memberId, kind: 'PAYMENT', amount: -amount, reference, referenceType, referenceId, idempotencyKey, recordedBy, occurredAt, tx: db });
   await postJournal({
     description: `Payment ${reference || ''}`.trim(),
     lines: [
       { accountCode: method === 'BANK' ? 'BANK' : 'CASH', debit: amount, credit: 0 },
       { accountCode: 'RECEIVABLE', debit: 0, credit: amount },
     ],
-    referenceType, referenceId, recordedBy, session,
+    referenceType, referenceId, recordedBy, tx: db,
   });
   // FIFO allocation (informational; ledger is authoritative).
-  const charges = await LedgerEntry.find({
-    member: memberId,
-    kind: { $in: ['VEHICLE_CHARGE', 'WEIGHBRIDGE_CHARGE', 'OTHER_CHARGE', 'OPENING'] },
-    amount: { $gt: 0 },
-  }).sort({ occurredAt: 1 }).session(session);
+  const charges = await db.ledgerEntry.findMany({
+    where: { memberId, kind: { in: ['VEHICLE_CHARGE', 'WEIGHBRIDGE_CHARGE', 'OTHER_CHARGE', 'OPENING'] }, amount: { gt: 0 } },
+    orderBy: { occurredAt: 'asc' },
+  });
   let remaining = amount;
-  const { PaymentAllocation } = await import('../models/Payments.js');
   for (const charge of charges) {
     if (remaining <= 0) break;
-    const allocated = await PaymentAllocation.aggregate([
-      { $match: { ledgerEntry: charge._id } },
-      { $group: { _id: null, total: { $sum: '$amount' } } },
-    ]).session(session);
-    const unpaid = charge.amount - (allocated[0]?.total || 0);
+    const allocated = await db.paymentAllocation.aggregate({ where: { ledgerEntryId: charge.id }, _sum: { amount: true } });
+    const unpaid = charge.amount - (allocated._sum.amount || 0);
     if (unpaid <= 0) continue;
     const take = Math.min(unpaid, remaining);
-    await PaymentAllocation.create([{ payment: referenceId, ledgerEntry: charge._id, amount: take }], { session });
+    // Allocation rows are informational and link to a Payment record. Direct
+    // ledger postings (e.g. the demo seed) carry no payment id, so they skip
+    // allocations; the ledger row remains the authoritative record.
+    if (referenceId) {
+      await db.paymentAllocation.create({ data: { paymentId: referenceId, ledgerEntryId: charge.id, amount: take } });
+    }
     remaining -= take;
   }
   return ledger;
@@ -104,49 +102,46 @@ export async function postPayment({ memberId, amount, reference, referenceType, 
 
 // Reverse a posted ledger row with an authorized reversal transaction.
 // Never silently deletes: creates a negating row + reversing journal entry.
-export async function reverseLedger({ ledgerId, reason, recordedBy, session }) {
-  const original = await LedgerEntry.findById(ledgerId).session(session);
+export async function reverseLedger({ ledgerId, reason, recordedBy, tx }) {
+  const db = tx || prisma;
+  if (!ledgerId) throw badRequest('Ledger entry not found');
+  const original = await db.ledgerEntry.findUnique({ where: { id: ledgerId } });
   if (!original) throw badRequest('Ledger entry not found');
   if (original.kind === 'REVERSAL') throw badRequest('A reversal cannot be reversed');
-  const existing = await LedgerEntry.findOne({ reversalOf: ledgerId }).session(session);
+  const existing = await db.ledgerEntry.findFirst({ where: { reversalOfId: ledgerId } });
   if (existing) throw badRequest('This entry was already reversed');
   const reversal = await appendLedger({
-    memberId: original.member, kind: 'REVERSAL', amount: -original.amount,
-    reference: `REV-${original.reference || original._id}`, referenceType: original.referenceType,
-    referenceId: original.referenceId, recordedBy, session,
+    memberId: original.memberId, kind: 'REVERSAL', amount: -original.amount,
+    reference: `REV-${original.reference || original.id}`, referenceType: original.referenceType,
+    referenceId: original.referenceId, recordedBy, tx: db,
   });
-  reversal.reversalOf = original._id;
-  reversal.reversalReason = reason;
-  await reversal.save({ session });
+  await db.ledgerEntry.update({ where: { id: reversal.id }, data: { reversalOfId: original.id, reversalReason: reason } });
   // Mirror the original journal entry (swap debit/credit per line) so the
   // books stay balanced. Opening rows have no journal entry — nothing to mirror.
-  const originalJournal = await JournalEntry.findOne({
-    referenceType: original.referenceType, referenceId: original.referenceId,
-  }).session(session);
+  const originalJournal = await db.journalEntry.findFirst({
+    where: { referenceType: original.referenceType, referenceId: original.referenceId },
+  });
   if (originalJournal) {
-    const [mirror] = await JournalEntry.create(
-      [{
+    const lines = (Array.isArray(originalJournal.lines) ? originalJournal.lines : []).map((l) => ({ accountCode: l.accountCode, debit: l.credit, credit: l.debit }));
+    await db.journalEntry.create({
+      data: {
         description: `Reversal of ${original.kind} ${original.reference || ''} — ${reason}`.trim(),
-        lines: originalJournal.lines.map((l) => ({ accountCode: l.accountCode, debit: l.credit, credit: l.debit })),
-        referenceType: original.referenceType, referenceId: original.referenceId,
-        reversalOf: originalJournal._id, recordedBy: recordedBy || null,
-      }],
-      { session }
-    );
-    void mirror;
+        lines, referenceType: original.referenceType, referenceId: original.referenceId,
+        reversalOfId: originalJournal.id, recordedById: recordedBy || null,
+      },
+    });
   }
-  return reversal;
+  return { ...reversal, reversalOfId: original.id, reversalReason: reason };
 }
 
 // Recompute every member's cached balance from its ledger (admin maintenance).
 export async function reconcileAll() {
-  const members = await Member.find({});
+  const members = await prisma.member.findMany({});
   let fixed = 0;
   for (const m of members) {
-    const real = await computeBalance(m._id);
+    const real = await computeBalance(m.id);
     if (real !== m.outstandingBalance) {
-      m.outstandingBalance = real;
-      await m.save();
+      await prisma.member.update({ where: { id: m.id }, data: { outstandingBalance: real } });
       fixed += 1;
     }
   }

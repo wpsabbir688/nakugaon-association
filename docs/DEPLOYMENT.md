@@ -1,30 +1,36 @@
 # Deployment (documentation only)
 
-**Nothing in this document has been provisioned.** No Atlas cluster, no
-hosting account, and no live URL exist for this project. The steps below are
-for the association (or its developer) to follow when ready to go live.
+**Nothing in this document has been provisioned.** No Neon database, no
+hosting account, and no live API URL exist for this project yet (the Netlify
+frontend shell is live, but it has no API behind it until the steps below
+are done). The steps below are for the association (or its developer) to
+follow when ready to go live.
 
-## 1. Database — MongoDB Atlas (M0 free tier is enough to start)
+## 1. Database — Neon PostgreSQL (free tier is enough to start)
 
-1. Create a project + free cluster (any region close to Bangladesh, e.g.
-   Mumbai `ap-south-1`).
-2. Database Access: create a database user with a strong password; restrict
-   to `readWrite` on the app database only.
-3. Network Access: allow only the API host's IP (or `0.0.0.0/0` temporarily
-   during setup — tighten before launch).
-4. Connection string form:
-   `mongodb+srv://<user>:<password>@<cluster>/<db>?retryWrites=true&w=majority`
-   Atlas clusters are replica sets by default, so transactions work.
-5. Run the reference-data seeder on first boot (fee rules + chart of
-   accounts seed automatically when the server starts with an empty database)
+1. Create a Neon project + database (region close to Bangladesh, e.g.
+   Singapore).
+2. Create a database role with a strong password, restricted to the app
+   database.
+3. Copy the **direct (non-pooled)** connection string — pooled
+   (PgBouncer transaction-mode) URLs break Prisma interactive transactions,
+   which this app requires. The string must look like:
+   `postgresql://<user>:<password>@<host>/<db>?sslmode=require`
+4. Apply the schema once against that database:
+   `DATABASE_URL='<direct-url>' npx prisma migrate deploy` (run from
+   `server/`).
+5. Fee rules + chart of accounts seed automatically when the server starts
    — then create the real admin with `scripts/create-admin.js` against the
-   Atlas URI. **Never run the demo seed against production.**
+   Neon URI (e.g. via a one-time Render build command, since Render's free
+   Shell is paywalled). **Never run the demo seed against production.**
 
 ## 2. API — any Node host (Render, Railway, Fly.io, VPS)
 
-- Runtime: Node.js 20+, `npm --prefix server install --omit=dev`.
-- Start: `node server/src/index.js` (or `npm --prefix server start`).
-- Environment: `MONGODB_URI` (Atlas), `PORT`, `NODE_ENV=production`,
+- Runtime: Node.js 20+, root directory `server`.
+- Build: `npm install && npx prisma generate && npx prisma migrate deploy`.
+- Start: `npm start` (runs `node src/server.js`; `PORT` comes from the host).
+- Environment: `DATABASE_URL` (Neon direct URL — never pooled), `PORT`,
+  `NODE_ENV=production`,
   `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET` (long, random, different),
   `CLIENT_URL` (the exact frontend origin — CORS allows only this origin),
   `STORAGE_DRIVER=local`, `UPLOAD_DIR` (a persistent disk path — on
@@ -56,7 +62,7 @@ cd client && npm install && npm run build   # outputs client/dist/
 - [ ] Uploads on persistent storage (or S3 driver implemented)
 - [ ] SMTP configured if password-reset email is expected (otherwise resets
       are log-only and staff must assist)
-- [ ] Backups enabled on the Atlas cluster (daily snapshots)
+- [ ] Backups enabled on the Neon project (point-in-time recovery / snapshots)
 - [ ] HTTPS on both frontend and API (required for the HttpOnly
       cross-site refresh cookie: set `SameSite=None; Secure` in production —
       see `server/src` cookie settings)

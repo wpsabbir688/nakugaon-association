@@ -1,16 +1,18 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import bcrypt from 'bcrypt';
-import mongoose from 'mongoose';
-import { createApp } from '../src/app.js';
-import { connectDb } from '../src/config/db.js';
-import { ensureReferenceData } from '../src/services/referenceData.js';
-import { User } from '../src/models/User.js';
-import { Member } from '../src/models/Member.js';
-import { FeeRule } from '../src/models/FeeRule.js';
-import { LedgerEntry } from '../src/models/LedgerEntry.js';
-import { Payment } from '../src/models/Payments.js';
-import { VehicleEntry, WeighbridgeEntry } from '../src/models/Entries.js';
+
+// The test database URL must be set BEFORE the app (and its Prisma client)
+// is imported, because Prisma reads DATABASE_URL at construction time.
+// Default: local VM Postgres over the Unix socket as the OS user (peer auth).
+// Override with TEST_DATABASE_URL on any other machine.
+process.env.DATABASE_URL =
+  process.env.TEST_DATABASE_URL ||
+  'postgresql://root@localhost:5432/nakugaon_test?host=/var/run/postgresql';
+
+const { createApp } = await import('../src/app.js');
+const { prisma, disconnectDb } = await import('../src/config/db.js');
+const { ensureReferenceData } = await import('../src/services/referenceData.js');
 
 const app = createApp();
 let adminToken, operatorToken, accountantToken, memberUserToken, memberId, memberDbId;
@@ -21,14 +23,27 @@ async function login(email, password) {
   return res.body.accessToken;
 }
 
+async function resetDb() {
+  // Truncate every table (FK-safe via CASCADE) and reset the app state.
+  const tables = [
+    'PaymentAllocation', 'VehicleEntry', 'WeighbridgeEntry', 'Payment',
+    'LedgerEntry', 'JournalEntry', 'Expense', 'Notice', 'AuditLog',
+    'SiteSetting', 'FeeRule', 'Account', 'Counter', 'User', 'Member',
+  ];
+  await prisma.$executeRawUnsafe(`TRUNCATE ${tables.map((t) => `"${t}"`).join(', ')} RESTART IDENTITY CASCADE`);
+}
+
 beforeAll(async () => {
-  await connectDb('mongodb://127.0.0.1:27017/nakugaon_test?replicaSet=rs0');
-  await mongoose.connection.dropDatabase();
+  await resetDb();
   await ensureReferenceData();
   const hash = await bcrypt.hash('Password@123', 12);
-  await User.create({ name: 'Admin', email: 'admin@test.local', passwordHash: hash, role: 'SUPER_ADMIN' });
-  await User.create({ name: 'Operator', email: 'op@test.local', passwordHash: hash, role: 'OPERATOR' });
-  await User.create({ name: 'Accountant', email: 'acc@test.local', passwordHash: hash, role: 'ACCOUNTANT' });
+  await prisma.user.createMany({
+    data: [
+      { name: 'Admin', email: 'admin@test.local', passwordHash: hash, role: 'SUPER_ADMIN' },
+      { name: 'Operator', email: 'op@test.local', passwordHash: hash, role: 'OPERATOR' },
+      { name: 'Accountant', email: 'acc@test.local', passwordHash: hash, role: 'ACCOUNTANT' },
+    ],
+  });
   adminToken = await login('admin@test.local', 'Password@123');
   operatorToken = await login('op@test.local', 'Password@123');
   accountantToken = await login('acc@test.local', 'Password@123');
@@ -38,13 +53,12 @@ beforeAll(async () => {
   expect(m.status).toBe(201);
   memberId = m.body.member.memberId;
   memberDbId = m.body.member._id;
-  const mu = await User.create({ name: 'Member User', email: 'member@test.local', passwordHash: hash, role: 'MEMBER', memberId: memberDbId });
-  void mu;
+  await prisma.user.create({ data: { name: 'Member User', email: 'member@test.local', passwordHash: hash, role: 'MEMBER', memberId: memberDbId } });
   memberUserToken = await login('member@test.local', 'Password@123');
 });
 
 afterAll(async () => {
-  await mongoose.disconnect();
+  await disconnectDb();
 });
 
 describe('members', () => {
@@ -73,7 +87,7 @@ describe('vehicle entries', () => {
     expect(res.status).toBe(201);
     expect(res.body.entry.total).toBe(200);
     expect(res.body.entry.feePerVehicle).toBe(50);
-    const ledger = await LedgerEntry.find({ member: memberDbId, kind: 'VEHICLE_CHARGE' });
+    const ledger = await prisma.ledgerEntry.findMany({ where: { memberId: memberDbId, kind: 'VEHICLE_CHARGE' } });
     expect(ledger).toHaveLength(1);
     expect(ledger[0].amount).toBe(200);
   });
@@ -86,7 +100,7 @@ describe('vehicle entries', () => {
       memberId, entryDate: '2026-10-24', quantity: 4, idempotencyKey: 'veh-test-1',
     });
     expect(dup.body.duplicate).toBe(true);
-    const ledger = await LedgerEntry.find({ member: memberDbId, kind: 'VEHICLE_CHARGE' });
+    const ledger = await prisma.ledgerEntry.findMany({ where: { memberId: memberDbId, kind: 'VEHICLE_CHARGE' } });
     expect(ledger).toHaveLength(1);
   });
 });
@@ -102,12 +116,10 @@ describe('weighbridge', () => {
     expect(res.body.entry.fee).toBe(fee);
   });
   it('preserves historical fees after a rule change', async () => {
-    const rule = await FeeRule.findOne({ key: 'WB_BD' });
-    await FeeRule.updateOne({ key: 'WB_BD' }, { $set: { amount: 250 } });
-    const old = await WeighbridgeEntry.findOne({ category: 'WB_BD' });
+    await prisma.feeRule.update({ where: { key: 'WB_BD' }, data: { amount: 250 } });
+    const old = await prisma.weighbridgeEntry.findFirst({ where: { category: 'WB_BD' } });
     expect(old.fee).toBe(200);
-    await FeeRule.updateOne({ key: 'WB_BD' }, { $set: { amount: 200 } });
-    void rule;
+    await prisma.feeRule.update({ where: { key: 'WB_BD' }, data: { amount: 200 } });
   });
 });
 
@@ -174,7 +186,7 @@ describe('public visibility and member portal', () => {
     expect(own.status).toBe(200);
   });
   it('public directory needs no auth', async () => {
-    const res = await request(app).get('/api/v1/public/members');
+    const res = await request(app).get(`/api/v1/public/members`);
     expect(res.status).toBe(200);
     expect(res.body.members.length).toBeGreaterThan(0);
   });
@@ -184,19 +196,19 @@ describe('dashboard consistency', () => {
   it('dashboard totals match direct ledger aggregation', async () => {
     const dash = await request(app).get('/api/v1/admin/dashboard').set('Authorization', `Bearer ${adminToken}`);
     expect(dash.status).toBe(200);
-    const direct = await Member.aggregate([{ $match: { status: 'ACTIVE' } }, { $group: { _id: null, total: { $sum: '$outstandingBalance' } } }]);
-    expect(dash.body.totalOutstanding).toBe(direct[0]?.total || 0);
+    const direct = await prisma.member.aggregate({ where: { status: 'ACTIVE' }, _sum: { outstandingBalance: true } });
+    expect(dash.body.totalOutstanding).toBe(direct._sum.outstandingBalance || 0);
     expect(dash.body.activeMembers).toBeGreaterThanOrEqual(3);
   });
 });
 
 describe('transaction rollback', () => {
   it('a failed vehicle entry leaves no partial documents', async () => {
-    const before = await VehicleEntry.countDocuments({});
+    const before = await prisma.vehicleEntry.count({});
     const res = await request(app).post('/api/v1/vehicles').set('Authorization', `Bearer ${operatorToken}`).send({
       memberId: 'NAK-9999', entryDate: '2026-10-24', quantity: 2,
     });
     expect(res.status).toBe(404);
-    expect(await VehicleEntry.countDocuments({})).toBe(before);
+    expect(await prisma.vehicleEntry.count({})).toBe(before);
   });
 });

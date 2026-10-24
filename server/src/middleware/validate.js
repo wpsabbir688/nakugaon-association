@@ -33,7 +33,11 @@ export function pageMeta(total, page, limit) {
   return { total, page, limit, pages: Math.ceil(total / limit) };
 }
 
-// Escape user input for RegExp-based search so it cannot inject regex operators.
-export function safeSearchRegex(text) {
-  return new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+// Case-insensitive substring search across the given fields. Prisma
+// parameterizes these values, so search input cannot inject operators.
+export function searchFilter(text, fields) {
+  if (!text) return undefined;
+  return {
+    OR: fields.map((f) => ({ [f]: { contains: text, mode: 'insensitive' } })),
+  };
 }
