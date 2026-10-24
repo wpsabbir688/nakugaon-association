@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+@theme {
+  --color-navy-900: #0b2545;
+  --color-navy-800: #12315e;
+  --color-navy-700: #1b3a5f;
+  --color-teal-600: #0f766e;
+  --color-teal-500: #14b8a6;
+  --font-sans: "Hind Siliguri", "Inter", system-ui, sans-serif;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: #f8fafc;
+  color: #0f172a;
+}
